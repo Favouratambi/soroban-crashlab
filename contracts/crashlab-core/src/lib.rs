@@ -226,6 +226,14 @@ pub use corpus_import::{
     import_seeds, import_seeds_with_schema, CorpusImportError, CorpusImportResult,
 };
 
+pub mod corpus_archive;
+pub use corpus_archive::{
+    compute_manifest_hash, current_engine_version, seed_content_hash, ArchiveEntry, ArchiveError,
+    ArchiveManifest, CorpusStore, EngineVersionPolicy, MergeReport, TaggedSeed,
+    CORPUS_ARCHIVE_FORMAT_VERSION, SUPPORTED_ARCHIVE_FORMATS,
+    CorpusArchive as PortableCorpusArchive,
+};
+
 pub mod retention;
 pub use retention::{RetentionPolicy, RetentionRecord};
 

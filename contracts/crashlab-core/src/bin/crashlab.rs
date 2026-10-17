@@ -22,6 +22,8 @@ use crashlab_core::{
     HealthSnapshot, HealthStatus, RetentionPolicy, RetentionRecord, LocalArtifactStore,
     ArtifactStore, RunCheckpoint, CaseBundleDocument, FixtureManifest, ProvenancePolicy,
     load_case_bundle_document_json,
+    CorpusStore, EngineVersionPolicy, TaggedSeed, PortableCorpusArchive, seed_content_hash,
+    current_engine_version, import_seeds,
 };
 use crashlab_core::worker_partition::RingCoverage;
 use std::collections::HashSet;
@@ -46,6 +48,26 @@ fn main() {
         let rest: Vec<String> = args.collect();
         run_start_command(&rest);
         return;
+    }
+
+    // `corpus` subcommands are flag-heavy, so they collect the remaining
+    // arguments positionally rather than being arity-checked.
+    if a.as_deref() == Some("corpus") {
+        let rest: Vec<String> = args.collect();
+        match b.as_deref() {
+            Some("export") => {
+                corpus_export_command(&rest);
+                return;
+            }
+            Some("import") => {
+                corpus_import_command(&rest);
+                return;
+            }
+            _ => {
+                print_usage();
+                std::process::exit(1);
+            }
+        }
     }
 
     let c = args.next();
@@ -232,6 +254,8 @@ fn print_usage() {
                 crashlab regression-suite <suite-json-path-or-directory> [--report <report.json>]\n\
                 crashlab fixture verify <manifest-or-bundle-json> [--policy <require|warn|off>]\n\
                 crashlab fixture show <manifest-or-bundle-json> [--json]\n\
+                crashlab corpus export <corpus-json> --out <archive.json> [--tag <t>]... [--coverage <text>]\n\
+                crashlab corpus import <archive.json> [--into <corpus.json>] [--engine <require|skip|ignore>] [--dry-run]\n\
                 crashlab retention sweep [--dry-run] [--heartbeat-ttl <secs>] [--grace-period <secs>]\n\
                 \n\
                 run start options:\n\
@@ -1331,4 +1355,193 @@ fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
     }
 
     println!("sweep summary: pruned {deleted_bundles} bundle(s), {deleted_checkpoints} checkpoint(s).");
+}
+
+/// Prints `msg` to stderr and exits with status 1.
+fn die(msg: &str) -> ! {
+    eprintln!("{msg}");
+    std::process::exit(1);
+}
+
+/// Loads a local corpus store from a JSON file.
+///
+/// Accepts either a serialized [`CorpusStore`] (seeds + provenance map), a
+/// legacy `CorpusArchive` document, or a raw `Vec<CaseSeed>` array.
+fn load_corpus_store(path: &str) -> CorpusStore {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => die(&format!("failed to read {path}: {e}")),
+    };
+    if let Ok(store) = serde_json::from_str::<CorpusStore>(&text) {
+        return store;
+    }
+    match import_seeds(text.as_bytes()) {
+        Ok(seeds) => CorpusStore::from_seeds(seeds),
+        Err(e) => die(&format!("failed to parse corpus {path}: {e}")),
+    }
+}
+
+/// `crashlab corpus export <corpus-json> --out <archive.json> [--tag <t>]... [--coverage <text>]`
+///
+/// Builds a portable, content-addressed archive from a local corpus so it can be
+/// shared across campaigns. Prints the archive id on success.
+fn corpus_export_command(args: &[String]) {
+    let mut input: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut tags: Vec<String> = Vec::new();
+    let mut coverage: Option<String> = None;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--out" => match iter.next() {
+                Some(v) => out = Some(v.clone()),
+                None => die("missing value for --out"),
+            },
+            "--tag" => match iter.next() {
+                Some(v) => tags.push(v.clone()),
+                None => die("missing value for --tag"),
+            },
+            "--coverage" => match iter.next() {
+                Some(v) => coverage = Some(v.clone()),
+                None => die("missing value for --coverage"),
+            },
+            other if other.starts_with("--") => {
+                die(&format!("unknown option for corpus export: {other}"))
+            }
+            other => {
+                if input.is_some() {
+                    die("corpus export expects a single <corpus-json> path");
+                }
+                input = Some(other.to_string());
+            }
+        }
+    }
+
+    let input = match input {
+        Some(p) => p,
+        None => die("missing <corpus-json> path"),
+    };
+
+    let store = load_corpus_store(&input);
+    let tagged: Vec<TaggedSeed> = store
+        .sorted_seeds()
+        .into_iter()
+        .map(|seed| {
+            let seed_tags = store.tags_for(&seed_content_hash(&seed)).to_vec();
+            TaggedSeed {
+                seed,
+                tags: seed_tags,
+            }
+        })
+        .collect();
+
+    let archive = PortableCorpusArchive::build_tagged(tagged, tags, coverage);
+    let bytes = match archive.to_json() {
+        Ok(b) => b,
+        Err(e) => die(&format!("failed to serialize archive: {e}")),
+    };
+
+    match out {
+        Some(path) => {
+            if let Err(e) = fs::write(&path, &bytes) {
+                die(&format!("failed to write archive to {path}: {e}"));
+            }
+            println!(
+                "exported {} seed(s) to {path} (archive id {})",
+                archive.manifest.seed_count,
+                archive.archive_id()
+            );
+        }
+        None => {
+            println!("{}", String::from_utf8_lossy(&bytes));
+            eprintln!(
+                "exported {} seed(s) (archive id {})",
+                archive.manifest.seed_count,
+                archive.archive_id()
+            );
+        }
+    }
+}
+
+/// `crashlab corpus import <archive.json> [--into <corpus.json>] [--engine <p>] [--dry-run]`
+///
+/// Verifies the archive (content + manifest hashes, schema), checks engine
+/// compatibility under `--engine`, and merges into the local corpus with dedup
+/// by content hash. `--into` is updated in place unless `--dry-run` is set;
+/// without `--into` the merged report is printed only.
+fn corpus_import_command(args: &[String]) {
+    let mut archive_path: Option<String> = None;
+    let mut into: Option<String> = None;
+    let mut policy = EngineVersionPolicy::AllowCompatible;
+    let mut dry_run = false;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--into" => match iter.next() {
+                Some(v) => into = Some(v.clone()),
+                None => die("missing value for --into"),
+            },
+            "--engine" => match iter.next() {
+                Some(v) => match EngineVersionPolicy::parse(v) {
+                    Some(p) => policy = p,
+                    None => die("invalid --engine policy (expected require|skip|ignore)"),
+                },
+                None => die("missing value for --engine"),
+            },
+            "--dry-run" => dry_run = true,
+            other if other.starts_with("--") => {
+                die(&format!("unknown option for corpus import: {other}"))
+            }
+            other => {
+                if archive_path.is_some() {
+                    die("corpus import expects a single <archive> path");
+                }
+                archive_path = Some(other.to_string());
+            }
+        }
+    }
+
+    let archive_path = match archive_path {
+        Some(p) => p,
+        None => die("missing <archive> path"),
+    };
+
+    let bytes = match fs::read(&archive_path) {
+        Ok(b) => b,
+        Err(e) => die(&format!("failed to read archive {archive_path}: {e}")),
+    };
+    let archive = match PortableCorpusArchive::from_json(&bytes) {
+        Ok(a) => a,
+        Err(e) => die(&format!("archive verification failed: {e}")),
+    };
+
+    let mut store = match &into {
+        Some(path) if Path::new(path).exists() => load_corpus_store(path),
+        _ => CorpusStore::new(),
+    };
+
+    let report = match store.merge_archive(&archive, policy, &current_engine_version(), dry_run) {
+        Ok(r) => r,
+        Err(e) => die(&format!("merge failed: {e}")),
+    };
+
+    println!("{}", report.summary());
+
+    if !dry_run {
+        if let Some(path) = &into {
+            let json = match serde_json::to_vec_pretty(&store) {
+                Ok(j) => j,
+                Err(e) => die(&format!("failed to serialize merged corpus: {e}")),
+            };
+            if let Err(e) = fs::write(path, json) {
+                die(&format!("failed to write merged corpus to {path}: {e}"));
+            }
+            println!(
+                "wrote merged corpus ({} seed(s)) to {path}",
+                store.seeds.len()
+            );
+        }
+    }
 }
