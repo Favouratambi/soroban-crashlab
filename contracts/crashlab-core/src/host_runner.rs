@@ -52,6 +52,7 @@
 
 #![cfg(feature = "host-runner")]
 
+use crate::budget_targeting::{BudgetTargeter, ConsumptionSample};
 use crate::runner::{ContractRunner, RunnerError};
 use crate::{CaseSeed, CrashSignature};
 use soroban_sdk::testutils::Address as _;
@@ -77,6 +78,9 @@ pub struct HostContractRunner {
     mock_auths: bool,
     /// Explicit contract wasm bytes, taking precedence over `CRASHLAB_CONTRACT_WASM`.
     wasm: Option<Vec<u8>>,
+    /// Optional budget-boundary targeting loop fed with observed meter
+    /// consumption (#1859).
+    budget_targeter: Option<BudgetTargeter>,
 }
 
 impl HostContractRunner {
@@ -89,6 +93,7 @@ impl HostContractRunner {
         Self {
             mock_auths: true,
             wasm: None,
+            budget_targeter: None,
         }
     }
 
@@ -98,6 +103,7 @@ impl HostContractRunner {
         Self {
             mock_auths: true,
             wasm: Some(wasm),
+            budget_targeter: None,
         }
     }
 
@@ -109,7 +115,26 @@ impl HostContractRunner {
         Self {
             mock_auths,
             wasm: None,
+            budget_targeter: None,
         }
+    }
+
+    /// Attaches a budget-boundary targeting loop; subsequent
+    /// [`Self::run_seed_with_consumption`] calls observe each seed's meter
+    /// consumption into it.
+    pub fn with_budget_targeting(mut self, targeter: BudgetTargeter) -> Self {
+        self.budget_targeter = Some(targeter);
+        self
+    }
+
+    /// The attached targeting loop, if any.
+    pub fn budget_targeter(&self) -> Option<&BudgetTargeter> {
+        self.budget_targeter.as_ref()
+    }
+
+    /// Mutable access to the attached targeting loop, if any.
+    pub fn budget_targeter_mut(&mut self) -> Option<&mut BudgetTargeter> {
+        self.budget_targeter.as_mut()
     }
 
     /// Resolves which wasm to deploy, in priority order: explicit bytes >
@@ -134,6 +159,26 @@ impl HostContractRunner {
     /// invoked exactly once; the returned signature reflects the actual host
     /// outcome.
     fn execute_in_env(&self, seed: &CaseSeed) -> Result<CrashSignature, RunnerError> {
+        self.execute_in_env_with_consumption(seed)
+            .map(|(signature, _consumption)| signature)
+    }
+
+    /// Like [`Self::execute_in_env`], but also reports the meter consumption
+    /// of the execution (#1859).
+    ///
+    /// The host's `InvocationMeter` resets the budget counters at the start of
+    /// every metered contract invocation, so the readings are scoped rather
+    /// than cumulative: `cpu_insns`/`mem_bytes` hold the *final* metered
+    /// invocation's consumption, while `min_builtin` is the fixed
+    /// builtin/setup floor accumulated **before** the scenario runs
+    /// (contract registration, auth mocking, address generation). The two are
+    /// measured at different scopes, so neither dominates the other. When the
+    /// W5-A12 per-phase fee/budget simulation lands, the floor becomes the
+    /// measured invoke-only delta.
+    fn execute_in_env_with_consumption(
+        &self,
+        seed: &CaseSeed,
+    ) -> Result<(CrashSignature, ConsumptionSample), RunnerError> {
         let wasm = self.resolve_wasm()?;
 
         // `Env::default()` would write `test_snapshots/<...>.json` files on
@@ -150,18 +195,43 @@ impl HostContractRunner {
         #[allow(deprecated)] // register_contract_wasm is the testutils wasm-deploy API
         let contract_id = env.register_contract_wasm(None, wasm.as_slice());
 
+        let min_builtin = env.cost_estimate().budget().cpu_instruction_cost();
+
         let category = run_seed_scenario(&env, &contract_id, seed);
+
+        let budget = env.cost_estimate().budget();
+        let sample = ConsumptionSample {
+            cpu_insns: budget.cpu_instruction_cost(),
+            mem_bytes: budget.memory_bytes_cost(),
+            min_builtin,
+        };
+
         let digest = seed
             .payload
             .iter()
             .fold(seed.id, |acc, b| acc.wrapping_mul(1099511628211).wrapping_add(*b as u64));
         let signature_hash = crate::compute_signature_hash(&category, &seed.payload);
 
-        Ok(CrashSignature {
+        let signature = CrashSignature {
             category,
             digest,
             signature_hash,
-        })
+        };
+        Ok((signature, sample))
+    }
+
+    /// Executes a seed and, when a targeting loop is attached, feeds the
+    /// observed consumption to it so the next knob seed walks the binary
+    /// search toward the metering edge (#1859).
+    pub fn run_seed_with_consumption(
+        &mut self,
+        seed: &CaseSeed,
+    ) -> Result<(CrashSignature, ConsumptionSample), RunnerError> {
+        let (signature, sample) = self.execute_in_env_with_consumption(seed)?;
+        if let Some(targeter) = self.budget_targeter.as_mut() {
+            targeter.observe(&sample);
+        }
+        Ok((signature, sample))
     }
 }
 
@@ -484,6 +554,88 @@ mod tests {
         assert_eq!(
             payload_le_i128(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]),
             i64::MAX as i128
+        );
+    }
+
+    #[test]
+    fn host_runner_reports_deterministic_meter_consumption() {
+        let s = seed(1, vec![0x01]);
+
+        let mut runner = HostContractRunner::new();
+        let (sig, sample) = runner
+            .run_seed_with_consumption(&s)
+            .expect("execution succeeded");
+        assert_eq!(sig.category, "success");
+        assert!(sample.cpu_insns > 0, "cpu instructions must be metered");
+        assert!(sample.mem_bytes > 0, "memory bytes must be metered");
+        assert!(
+            sample.min_builtin > 0,
+            "setup floor must accumulate builtin charges"
+        );
+
+        let mut other = HostContractRunner::new();
+        let (_, sample2) = other
+            .run_seed_with_consumption(&s)
+            .expect("second execution succeeded");
+        assert_eq!(sample, sample2, "identical seeds must meter identically");
+    }
+
+    #[test]
+    fn host_runner_consumption_path_matches_plain_run_seed() {
+        let s = seed(2, vec![0x00]);
+
+        let mut measuring = HostContractRunner::new();
+        let (measured, _) = measuring.run_seed_with_consumption(&s).expect("run");
+
+        let mut plain = HostContractRunner::new();
+        let plain_sig = plain.run_seed(&s).expect("run");
+
+        assert_eq!(measured, plain_sig);
+    }
+
+    #[test]
+    fn host_runner_feeds_attached_budget_targeter() {
+        use crate::budget_targeting::{BandStatus, BudgetTargetConfig};
+
+        let targeter = BudgetTargeter::new(BudgetTargetConfig::default(), 0x5EED);
+        let mut runner = HostContractRunner::new().with_budget_targeting(targeter);
+
+        let s = seed(1, vec![0x01]);
+        let (sig, _) = runner
+            .run_seed_with_consumption(&s)
+            .expect("execution succeeded");
+        assert_eq!(sig.category, "success");
+
+        let targeter = runner.budget_targeter().expect("targeter attached");
+        assert_eq!(targeter.iterations(), 1, "one observation per seed");
+        assert!(targeter.budget_edge().is_none());
+        assert!(
+            matches!(targeter.last_status(), Some(status) if status != BandStatus::InBand),
+            "a token invocation sits far below the metering edge"
+        );
+    }
+
+    #[test]
+    fn budget_knob_seed_executes_through_host_runner() {
+        use crate::budget_targeting::{BudgetKnobs, BudgetTargetConfig};
+
+        let targeter = BudgetTargeter::new(BudgetTargetConfig::default(), 7);
+        let other = BudgetTargeter::new(BudgetTargetConfig::default(), 7);
+        assert_eq!(
+            targeter.current_seed(42).payload,
+            other.current_seed(42).payload
+        );
+
+        let s = targeter.current_seed(42);
+        assert_eq!(s.payload.len(), 21);
+        let knobs = BudgetKnobs::from_payload(&s.payload).expect("payload decodes");
+        assert_eq!(&knobs, targeter.knobs());
+
+        let mut runner = HostContractRunner::new();
+        let (sig, _) = runner.run_seed_with_consumption(&s).expect("run");
+        assert_eq!(
+            sig.signature_hash,
+            crate::compute_signature_hash(&sig.category, &s.payload)
         );
     }
 }

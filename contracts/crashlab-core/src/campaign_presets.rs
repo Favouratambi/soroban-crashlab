@@ -10,6 +10,9 @@
 //! threshold, and response action) so cost-aware budgeting behaviour is configured
 //! per campaign class (smoke/touch vs deep) and reproducible across runs.
 
+use crate::budget_targeting::{
+    BudgetTargetPolicy, DEFAULT_BAND_WIDTH_BPS, DEFAULT_EDGE_PRIORITY_BOOST_BPS,
+};
 use crate::mutation_budget::MutationBudget;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -269,6 +272,25 @@ impl CampaignPreset {
             CampaignPreset::Deep => "deep",
         }
     }
+
+    /// Budget-boundary targeting policy for this preset (#1859).
+    ///
+    /// The policy fixes the ±5% target-band width and the edge-priority
+    /// boost for [`crate::budget_targeting::BudgetTargeter`] and only varies
+    /// the iteration cap, so quick smoke campaigns search fewer knob values
+    /// while deep campaigns get the full binary-search budget.
+    pub const fn budget_target_policy(self) -> BudgetTargetPolicy {
+        let max_iterations = match self {
+            CampaignPreset::Smoke => 8,
+            CampaignPreset::Nightly => 16,
+            CampaignPreset::Deep => 32,
+        };
+        BudgetTargetPolicy {
+            band_width_bps: DEFAULT_BAND_WIDTH_BPS,
+            max_iterations,
+            edge_priority_boost_bps: DEFAULT_EDGE_PRIORITY_BOOST_BPS,
+        }
+    }
 }
 
 impl Default for CampaignPreset {
@@ -500,5 +522,24 @@ mod tests {
         let json = serde_json::to_string(&policy).unwrap();
         let back: PlateauPolicy = serde_json::from_str(&ajson).unwrap();
         assert_eq!(back, policy);
+    }
+
+    #[test]
+    fn budget_target_policy_uses_default_band_and_boost() {
+        for p in CampaignPreset::ALL {
+            let policy = p.budget_target_policy();
+            assert_eq!(policy.band_width_bps, 500);
+            assert_eq!(policy.edge_priority_boost_bps, 2_000);
+        }
+    }
+
+    #[test]
+    fn budget_target_iterations_scale_with_preset_depth() {
+        let s = CampaignPreset::Smoke.budget_target_policy();
+        let n = CampaignPreset::Nightly.budget_target_policy();
+        let d = CampaignPreset::Deep.budget_target_policy();
+        assert_eq!((s.max_iterations, n.max_iterations, d.max_iterations), (8, 16, 32));
+        assert!(s.max_iterations < n.max_iterations);
+        assert!(n.max_iterations < d.max_iterations);
     }
 }
