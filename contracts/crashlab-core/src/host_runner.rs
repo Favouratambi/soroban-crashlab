@@ -787,10 +787,14 @@ mod tests {
         assert_eq!(&knobs, targeter.knobs());
 
         let mut runner = HostContractRunner::new();
-        let (sig, _) = runner.run_seed_with_consumption(&s).expect("run");
-        assert_eq!(
-            sig.signature_hash,
-            crate::compute_signature_hash(&sig.category, &s.payload)
-        );
+        let (sig, sample) = runner.run_seed_with_consumption(&s).expect("run");
+        assert!(sample.cpu_insns > 0, "meter captured CPU instructions");
+
+        // Host-runner signatures carry the diagnostics-aware hash (the same
+        // convention every other host runner signature uses), not the
+        // payload-only `compute_signature_hash`.
+        let outcome = runner.run_seed_with_diagnostics(&s).expect("run");
+        assert_eq!(sig.category, outcome.signature.category);
+        assert_eq!(sig.signature_hash, outcome.signature.signature_hash);
     }
 }
