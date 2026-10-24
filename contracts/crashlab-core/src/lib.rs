@@ -158,6 +158,13 @@ pub mod campaign_presets;
 pub use campaign_presets::{
     CampaignClass, CampaignParameters, CampaignPreset, ParseCampaignPresetError,
 };
+pub mod budget_targeting;
+pub use budget_targeting::{
+    apply_budget_edge_priority, classify_exhaustion, is_exhausted, metering_dictionary, BandStatus,
+    BudgetEdge, BudgetKnobs, BudgetTargetConfig, BudgetTargetPolicy, BudgetTargeter,
+    ConsumptionSample, ExhaustionOrigin, ExhaustionRecord, KnobBounds, MeterDimension,
+    MeteringLimits, TargetBand,
+};
 pub mod capacity;
 pub use capacity::{
     check_admission, QuotaGuard, QuotaLimits, QuotaResource, QuotaUsage, QuotaViolation,
