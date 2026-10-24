@@ -411,6 +411,7 @@ mod tests {
             environment: None,
             failure_payload: Vec::new(),
             rpc_envelope: None,
+        engine_version: crate::engine_version::ENGINE_VERSION.to_string(),
         }
     }
 

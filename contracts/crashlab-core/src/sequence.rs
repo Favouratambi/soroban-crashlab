@@ -838,6 +838,7 @@ mod tests {
     fn v1_bundle_document_loads_as_one_step_with_expected_class() {
         let doc = CaseBundleDocument {
             schema: 1,
+            engine_version: crate::engine_version::ENGINE_VERSION.to_string(),
             seed: CaseSeed {
                 id: 3,
                 payload: vec![0xA0],
