@@ -34,8 +34,8 @@ jobs:
 
     services:
       minio:
-        # 2026.4.10-photon-5-r0 (alias: latest)
-        image: bitnami/minio@sha256:e4a9e29cc120b1c216b9d8370507498e4608ee3e09cb317eb0743605210d0264
+        # Last published Bitnami MinIO image, mirrored in bitnamilegacy.
+        image: bitnamilegacy/minio@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
         ports:
           - 9000:9000
         env:
